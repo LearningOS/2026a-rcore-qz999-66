@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, VirtAddr};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -133,6 +134,34 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// Count one more call of the syscall `syscall_id` for the current task.
+    fn increase_current_syscall_times(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].increase_syscall_times(syscall_id);
+    }
+
+    /// How many times the current task has called the syscall `syscall_id`.
+    fn get_current_syscall_times(&self, syscall_id: usize) -> usize {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].get_syscall_times(syscall_id)
+    }
+
+    /// Map a new memory area for the current task.
+    fn mmap_current(&self, start: VirtAddr, len: usize, permission: MapPermission) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].mmap(start, len, permission)
+    }
+
+    /// Unmap a memory area of the current task.
+    fn munmap_current(&self, start: VirtAddr, len: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].munmap(start, len)
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +230,27 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Count one more call of the syscall `syscall_id` for the current task.
+///
+/// It is called at the very beginning of the syscall handler, so the call of
+/// `sys_trace` itself is counted as well, which is what the test cases expect.
+pub fn increase_current_syscall_times(syscall_id: usize) {
+    TASK_MANAGER.increase_current_syscall_times(syscall_id);
+}
+
+/// How many times the current task has called the syscall `syscall_id`.
+pub fn get_current_syscall_times(syscall_id: usize) -> usize {
+    TASK_MANAGER.get_current_syscall_times(syscall_id)
+}
+
+/// Map a new memory area for the current task.
+pub fn mmap_current(start: usize, len: usize, permission: MapPermission) -> bool {
+    TASK_MANAGER.mmap_current(VirtAddr(start), len, permission)
+}
+
+/// Unmap a memory area of the current task.
+pub fn munmap_current(start: usize, len: usize) -> bool {
+    TASK_MANAGER.munmap_current(VirtAddr(start), len)
 }

@@ -1,6 +1,6 @@
 //! Types related to task management
 use super::TaskContext;
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::mm::{
     kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
 };
@@ -28,6 +28,12 @@ pub struct TaskControlBlock {
 
     /// Program break
     pub program_brk: usize,
+
+    /// How many times each syscall has been called by this task.
+    ///
+    /// The syscall id is used as the index, so that `sys_trace` can report
+    /// the statistics of the current task in constant time.
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
 }
 
 impl TaskControlBlock {
@@ -63,6 +69,7 @@ impl TaskControlBlock {
             base_size: user_sp,
             heap_bottom: user_sp,
             program_brk: user_sp,
+            syscall_times: [0; MAX_SYSCALL_NUM],
         };
         // prepare TrapContext in user space
         let trap_cx = task_control_block.get_trap_cx();
@@ -74,6 +81,28 @@ impl TaskControlBlock {
             trap_handler as usize,
         );
         task_control_block
+    }
+    /// Count one more call of the syscall with id `syscall_id`.
+    pub fn increase_syscall_times(&mut self, syscall_id: usize) {
+        if syscall_id < MAX_SYSCALL_NUM {
+            self.syscall_times[syscall_id] += 1;
+        }
+    }
+    /// How many times the syscall with id `syscall_id` has been called.
+    pub fn get_syscall_times(&self, syscall_id: usize) -> usize {
+        if syscall_id < MAX_SYSCALL_NUM {
+            self.syscall_times[syscall_id] as usize
+        } else {
+            0
+        }
+    }
+    /// Map a new memory area of the task, return false if failed.
+    pub fn mmap(&mut self, start: VirtAddr, len: usize, permission: MapPermission) -> bool {
+        self.memory_set.mmap(start, len, permission)
+    }
+    /// Unmap a memory area of the task, return false if failed.
+    pub fn munmap(&mut self, start: VirtAddr, len: usize) -> bool {
+        self.memory_set.munmap(start, len)
     }
     /// change the location of the program break. return None if failed.
     pub fn change_program_brk(&mut self, size: i32) -> Option<usize> {
