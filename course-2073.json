@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "courseId": 2073,
+  "repository": "LearningOS/2026a-rcore-qz999-66",
+  "user": "qz999-66",
+  "totalScore": 500,
+  "chapters": {
+    "ch5": {
+      "points": "15/15",
+      "score": 100,
+      "commit": "e88c802104d1be346d2f036c0240b4b028e0ed7a"
+    }
+  },
+  "score": 100,
+  "upload": {
+    "status": "pending",
+    "runId": "42050289199",
+    "runAttempt": "1"
+  }
+}
