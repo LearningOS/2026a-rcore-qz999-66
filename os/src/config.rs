@@ -15,6 +15,10 @@ pub const APP_BASE_ADDRESS: usize = 0x80400000;
 /// size limit of app
 pub const APP_SIZE_LIMIT: usize = 0x20000;
 
+/// the max number of syscalls whose times are recorded, which is larger
+/// than the largest syscall id used in this course
+pub const MAX_SYSCALL_NUM: usize = 512;
+
 /// clock frequency
 pub const CLOCK_FREQ: usize = 12500000;
 /// the physical memory end
