@@ -1,10 +1,15 @@
 use crate::{
+    config::PAGE_SIZE,
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{
+        translated_byte_buffer_checked, translated_ref, translated_refmut, translated_str,
+        MapPermission, VirtAddr,
+    },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
-        suspend_current_and_run_next, SignalFlags,
+        suspend_current_and_run_next, ProcessControlBlock, SignalFlags,
     },
+    timer::get_time_us,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
 
@@ -146,39 +151,107 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     }
 }
 
+/// Copy `src` into the memory of the current process at `ptr`.
+///
+/// Return `false` if the range is not writable by the current process.
+fn write_to_user(ptr: *mut u8, src: &[u8]) -> bool {
+    match translated_byte_buffer_checked(current_user_token(), ptr, src.len(), true) {
+        Some(buffers) => {
+            let mut copied = 0;
+            for buffer in buffers {
+                let len = buffer.len().min(src.len() - copied);
+                buffer[..len].copy_from_slice(&src[copied..copied + len]);
+                copied += len;
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 /// get_time syscall
 ///
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+/// The `TimeVal` is written through the page table of the current process, so
+/// it also works when the structure lies across two pages.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_get_time",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &time_val as *const TimeVal as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    if write_to_user(ts as *mut u8, bytes) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Convert the `port` given by the user into `MapPermission`.
+///
+/// The three lowest bits stand for readable, writable and executable, and a
+/// page can always be accessed in user mode.
+fn port_to_permission(port: usize) -> Option<MapPermission> {
+    if port == 0 || port > 0b111 {
+        return None;
+    }
+    let mut permission = MapPermission::U;
+    if port & 0b001 != 0 {
+        permission |= MapPermission::R;
+    }
+    if port & 0b010 != 0 {
+        permission |= MapPermission::W;
+    }
+    if port & 0b100 != 0 {
+        permission |= MapPermission::X;
+    }
+    Some(permission)
 }
 
 /// mmap syscall
-///
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_mmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    if start % PAGE_SIZE != 0 || len == 0 {
+        return -1;
+    }
+    let permission = match port_to_permission(port) {
+        Some(permission) => permission,
+        None => return -1,
+    };
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if inner.memory_set.mmap(VirtAddr(start), len, permission) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// munmap syscall
-///
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_munmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if inner.memory_set.munmap(VirtAddr(start), len) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -191,23 +264,53 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 // }
 
 /// spawn syscall
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
+///
+/// Create a new process which executes the program named `path`. It is equals
+/// to fork + exec, but the address space of the parent is never copied.
+pub fn sys_spawn(path: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_spawn",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    // the program to run is a file in the file system
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let all_data = app_inode.read_all();
+        let process = current_process();
+        let child = ProcessControlBlock::new(all_data.as_slice());
+        // the child is a child of the current process
+        child.inner_exclusive_access().parent = Some(Arc::downgrade(&process));
+        process
+            .inner_exclusive_access()
+            .children
+            .push(Arc::clone(&child));
+        let pid = child.getpid();
+        // the child returns 0 from spawn
+        let task = child.inner_exclusive_access().get_task(0);
+        let trap_cx = task.inner_exclusive_access().get_trap_cx();
+        trap_cx.x[10] = 0;
+        pid as isize
+    } else {
+        -1
+    }
 }
 
 /// set priority syscall
 ///
-/// YOUR JOB: Set task priority
-pub fn sys_set_priority(_prio: isize) -> isize {
+/// The priority must be in `[2, isize::MAX]`, return the new priority if it
+/// succeeds, otherwise return -1.
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_set_priority",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    if prio < 2 {
+        return -1;
+    }
+    if current_task().unwrap().set_priority(prio as usize) {
+        prio
+    } else {
+        -1
+    }
 }

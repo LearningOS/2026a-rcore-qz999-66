@@ -30,6 +30,18 @@ impl OSInode {
             inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0, inode }) },
         }
     }
+    /// The unique id of the disk inode behind this file
+    pub fn inode_id(&self) -> u32 {
+        self.inner.exclusive_access().inode.inode_id()
+    }
+    /// Whether this file is a directory
+    pub fn is_dir(&self) -> bool {
+        self.inner.exclusive_access().inode.is_dir()
+    }
+    /// The number of hard links of this file
+    pub fn nlink(&self) -> u32 {
+        self.inner.exclusive_access().inode.nlink()
+    }
     /// read all data from the inode in memory
     pub fn read_all(&self) -> Vec<u8> {
         trace!("kernel: OSInode::read_all");
@@ -50,6 +62,7 @@ impl OSInode {
 }
 
 lazy_static! {
+    /// The root inode of the file system
     pub static ref ROOT_INODE: Arc<Inode> = {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
@@ -128,6 +141,10 @@ impl File for OSInode {
     /// file writable?
     fn writable(&self) -> bool {
         self.writable
+    }
+    /// the concrete type of this file
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
     }
     /// read file data into buffer
     fn read(&self, mut buf: UserBuffer) -> usize {

@@ -1,42 +1,33 @@
-//! Disk layout & data structure layer
-//!
-//! In the easy-fs disk layout, the disk is divided into five contiguous regions:
-//!
-//!  - [`SuperBlock`]
-//!  - inode bitmap
-//!  - inode area with [`DiskInode`]
-//!  - data bitmap
-//!  - data area with DataBlock
-
 use super::{get_block_cache, BlockDevice, BLOCK_SZ};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter, Result};
 
+/// Magic number for sanity check
 const EFS_MAGIC: u32 = 0x3b800001;
+/// The max number of direct inodes
 const INODE_DIRECT_COUNT: usize = 28;
+/// The max length of inode name
 const NAME_LENGTH_LIMIT: usize = 27;
+/// The max number of indirect1 inodes
 const INODE_INDIRECT1_COUNT: usize = BLOCK_SZ / 4;
+/// The max number of indirect2 inodes
 const INODE_INDIRECT2_COUNT: usize = INODE_INDIRECT1_COUNT * INODE_INDIRECT1_COUNT;
+/// The upper bound of direct inode index
 const DIRECT_BOUND: usize = INODE_DIRECT_COUNT;
+/// The upper bound of indirect1 inode index
 const INDIRECT1_BOUND: usize = DIRECT_BOUND + INODE_INDIRECT1_COUNT;
+/// The upper bound of indirect2 inode indexs
 #[allow(unused)]
 const INDIRECT2_BOUND: usize = INDIRECT1_BOUND + INODE_INDIRECT2_COUNT;
-
-/// superblock of easy-fs
+/// Super block of a filesystem
 #[repr(C)]
 pub struct SuperBlock {
-    /// magic number
     magic: u32,
-    /// The number of total blocks in easy-fs
     pub total_blocks: u32,
-    /// The number of blocks used for inode bitmap
     pub inode_bitmap_blocks: u32,
-    /// The number of blocks used for inode area
     pub inode_area_blocks: u32,
-    /// The number of blocks used for data bitmap
     pub data_bitmap_blocks: u32,
-    /// The number of blocks used for data area
     pub data_area_blocks: u32,
 }
 
@@ -53,7 +44,7 @@ impl Debug for SuperBlock {
 }
 
 impl SuperBlock {
-    /// Initialize the superblock
+    /// Initialize a super block
     pub fn initialize(
         &mut self,
         total_blocks: u32,
@@ -71,53 +62,50 @@ impl SuperBlock {
             data_area_blocks,
         }
     }
-    /// Check if the superblock is valid according to the magic number
+    /// Check if a super block is valid using efs magic
     pub fn is_valid(&self) -> bool {
         self.magic == EFS_MAGIC
     }
 }
-
-/// Inode Type of easy-fs
+/// Type of a disk inode
 #[derive(PartialEq)]
 pub enum DiskInodeType {
-    /// File type
     File,
-    /// Directory type
     Directory,
 }
 
+/// A indirect block
 type IndirectBlock = [u32; BLOCK_SZ / 4];
+/// A data block
 type DataBlock = [u8; BLOCK_SZ];
-
-/// Inode struct in disk
+/// A disk inode
 #[repr(C)]
 pub struct DiskInode {
-    /// file size
     pub size: u32,
-    /// array of direct block id
     pub direct: [u32; INODE_DIRECT_COUNT],
-    /// one-level indirect block id
     pub indirect1: u32,
-    /// two-level indirect block id
     pub indirect2: u32,
-    /// inode type
     type_: DiskInodeType,
+    /// number of hard links pointing to this inode
+    pub nlink: u32,
 }
 
 impl DiskInode {
-    /// indirect1 and indirect2 block are allocated only when they are needed.
+    /// Initialize a disk inode, as well as all direct inodes under it
+    /// indirect1 and indirect2 block are allocated only when they are needed
     pub fn initialize(&mut self, type_: DiskInodeType) {
         self.size = 0;
         self.direct.iter_mut().for_each(|v| *v = 0);
         self.indirect1 = 0;
         self.indirect2 = 0;
         self.type_ = type_;
+        self.nlink = 1;
     }
-    /// inode is directory?
+    /// Whether this inode is a directory
     pub fn is_dir(&self) -> bool {
         self.type_ == DiskInodeType::Directory
     }
-    /// inode is file?
+    /// Whether this inode is a file
     #[allow(unused)]
     pub fn is_file(&self) -> bool {
         self.type_ == DiskInodeType::File
@@ -146,12 +134,12 @@ impl DiskInode {
         }
         total as u32
     }
-    /// Number of blocks needed to extend.
+    /// Get the number of data blocks that have to be allocated given the new size of data
     pub fn blocks_num_needed(&self, new_size: u32) -> u32 {
         assert!(new_size >= self.size);
         Self::total_blocks(new_size) - Self::total_blocks(self.size)
     }
-    /// block id of the start block corresponding to the file offset for read_at/write_at.
+    /// Get id of block given inner id
     pub fn get_block_id(&self, inner_id: u32, block_device: &Arc<dyn BlockDevice>) -> u32 {
         let inner_id = inner_id as usize;
         if inner_id < INODE_DIRECT_COUNT {
@@ -176,7 +164,7 @@ impl DiskInode {
                 })
         }
     }
-    /// increase file length to new_size and allocate new blocks.
+    /// Inncrease the size of current disk inode
     pub fn increase_size(
         &mut self,
         new_size: u32,
@@ -251,7 +239,6 @@ impl DiskInode {
     }
 
     /// Clear size to zero and return blocks that should be deallocated.
-    ///
     /// We will clear the block contents to zero later.
     pub fn clear_size(&mut self, block_device: &Arc<dyn BlockDevice>) -> Vec<u32> {
         let mut v: Vec<u32> = Vec::new();
@@ -324,7 +311,7 @@ impl DiskInode {
         self.indirect2 = 0;
         v
     }
-    /// Read file data at offset position from inode into buf
+    /// Read data from current disk inode
     pub fn read_at(
         &self,
         offset: usize,
@@ -364,7 +351,8 @@ impl DiskInode {
         }
         read_size
     }
-    /// Write file data at offset position from buf into inode
+    /// Write data into current disk inode
+    /// size must be adjusted properly beforehand
     pub fn write_at(
         &mut self,
         offset: usize,
@@ -403,16 +391,13 @@ impl DiskInode {
         write_size
     }
 }
-
+/// A directory entry
 #[repr(C)]
-/// Directory entry struct
 pub struct DirEntry {
-    /// File name
     name: [u8; NAME_LENGTH_LIMIT + 1],
-    /// Inode id
     inode_id: u32,
 }
-
+/// Size of a directory entry
 pub const DIRENT_SZ: usize = 32;
 
 impl DirEntry {
@@ -423,7 +408,7 @@ impl DirEntry {
             inode_id: 0,
         }
     }
-    /// Create a directory entry with name and inode number
+    /// Crate a directory entry from name and inode number
     pub fn new(name: &str, inode_id: u32) -> Self {
         let mut bytes = [0u8; NAME_LENGTH_LIMIT + 1];
         bytes[..name.len()].copy_from_slice(name.as_bytes());
@@ -432,20 +417,20 @@ impl DirEntry {
             inode_id,
         }
     }
-    /// Convert directory entry into immutable bytes
+    /// Serialize into bytes
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self as *const _ as usize as *const u8, DIRENT_SZ) }
     }
-    /// Convert directory entry into mutable bytes
+    /// Serialize into mutable bytes
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self as *mut _ as usize as *mut u8, DIRENT_SZ) }
     }
-    /// get the name of the directory entry
+    /// Get name of the entry
     pub fn name(&self) -> &str {
         let len = (0usize..).find(|i| self.name[*i] == 0).unwrap();
         core::str::from_utf8(&self.name[..len]).unwrap()
     }
-    /// get the inode id of the directory entry
+    /// Get inode number of the entry
     pub fn inode_id(&self) -> u32 {
         self.inode_id
     }

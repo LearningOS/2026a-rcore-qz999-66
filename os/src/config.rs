@@ -20,3 +20,8 @@ pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
 /// qemu board info
 pub use crate::board::{CLOCK_FREQ, MMIO};
+
+/// the big stride of the stride scheduling algorithm
+pub const BIG_STRIDE: usize = 1 << 32;
+/// the initial priority of a task
+pub const INIT_PRIORITY: usize = 16;

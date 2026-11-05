@@ -2,6 +2,7 @@
 
 use super::id::TaskUserRes;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
+use crate::config::{BIG_STRIDE, INIT_PRIORITY};
 use crate::trap::TrapContext;
 use crate::{mm::PhysPageNum, sync::UPSafeCell};
 use alloc::sync::{Arc, Weak};
@@ -41,6 +42,13 @@ pub struct TaskControlBlockInner {
     pub task_status: TaskStatus,
     /// It is set when active exit or execution error occurs
     pub exit_code: Option<i32>,
+    /// The priority of the task, used by the stride scheduling algorithm
+    pub priority: usize,
+    /// The stride of the task, i.e. how much the task has run
+    pub stride: usize,
+    /// The stride increment when the task is scheduled once, which is
+    /// `BIG_STRIDE / priority`
+    pub pass: usize,
 }
 
 impl TaskControlBlockInner {
@@ -75,9 +83,25 @@ impl TaskControlBlock {
                     task_cx: TaskContext::goto_trap_return(kstack_top),
                     task_status: TaskStatus::Ready,
                     exit_code: None,
+                    priority: INIT_PRIORITY,
+                    stride: 0,
+                    pass: BIG_STRIDE / INIT_PRIORITY,
                 })
             },
         }
+    }
+
+    /// Set the priority of the task, and update its `pass` accordingly.
+    ///
+    /// Return `false` if the priority is illegal (it must be at least 2).
+    pub fn set_priority(&self, priority: usize) -> bool {
+        if priority < 2 {
+            return false;
+        }
+        let mut inner = self.inner_exclusive_access();
+        inner.priority = priority;
+        inner.pass = (BIG_STRIDE / priority).max(1);
+        true
     }
 }
 

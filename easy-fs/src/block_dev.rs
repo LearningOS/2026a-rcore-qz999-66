@@ -1,12 +1,9 @@
-//! Block device interface.
-//!
-//! Define the block read-write interface [BlockDevice] that the device driver needs to implement
-
 use core::any::Any;
-
+/// Trait for block devices
+/// which reads and writes data in the unit of blocks
 pub trait BlockDevice: Send + Sync + Any {
-    /// Read a block from the block device.
+    ///Read data form block to buffer
     fn read_block(&self, block_id: usize, buf: &mut [u8]);
-    /// Write a block to the block device.
+    ///Write data from buffer to block
     fn write_block(&self, block_id: usize, buf: &[u8]);
 }

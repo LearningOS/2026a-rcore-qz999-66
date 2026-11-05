@@ -1,5 +1,8 @@
-use crate::fs::{make_pipe, open_file, OpenFlags, Stat};
-use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
+use crate::fs::{make_pipe, open_file, OpenFlags, Stat, StatMode, ROOT_INODE};
+use crate::mm::{
+    translated_byte_buffer, translated_byte_buffer_checked, translated_refmut, translated_str,
+    UserBuffer,
+};
 use crate::task::{current_process, current_task, current_user_token};
 use alloc::sync::Arc;
 /// write syscall
@@ -123,29 +126,80 @@ pub fn sys_dup(fd: usize) -> isize {
     new_fd as isize
 }
 
-/// YOUR JOB: Implement fstat.
-pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
+/// Get the metadata of the file with `fd`, and copy it to the user buffer.
+pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
     trace!(
-        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_fstat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return -1;
+    }
+    let file = match &inner.fd_table[fd] {
+        Some(file) => file.clone(),
+        None => return -1,
+    };
+    // release current PCB manually to avoid multi-borrow
+    drop(inner);
+    // only a real inode has metadata, stdin/stdout/pipe do not
+    let os_inode = match file.as_any().downcast_ref::<crate::fs::OSInode>() {
+        Some(os_inode) => os_inode,
+        None => return -1,
+    };
+    let mode = if os_inode.is_dir() {
+        StatMode::DIR
+    } else {
+        StatMode::FILE
+    };
+    let stat = Stat::new(0, os_inode.inode_id() as u64, mode, os_inode.nlink());
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &stat as *const Stat as *const u8,
+            core::mem::size_of::<Stat>(),
+        )
+    };
+    // `Stat` may be splitted by two pages, so copy it page by page
+    match translated_byte_buffer_checked(token, st as *const u8, bytes.len(), true) {
+        Some(buffers) => {
+            let mut copied = 0;
+            for buffer in buffers {
+                let len = buffer.len().min(bytes.len() - copied);
+                buffer[..len].copy_from_slice(&bytes[copied..copied + len]);
+                copied += len;
+            }
+            0
+        }
+        None => -1,
+    }
 }
 
-/// YOUR JOB: Implement linkat.
-pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
+/// Create a hard link `new_name` which points to the same inode as `old_name`.
+pub fn sys_linkat(old_name: *const u8, new_name: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_linkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let old_name = translated_str(token, old_name);
+    let new_name = translated_str(token, new_name);
+    // only the root directory is supported in this chapter
+    match ROOT_INODE.find(old_name.as_str()) {
+        Some(inode) => ROOT_INODE.link(new_name.as_str(), inode.inode_id()) as isize,
+        None => -1,
+    }
 }
 
-/// YOUR JOB: Implement unlinkat.
-pub fn sys_unlinkat(_name: *const u8) -> isize {
+/// Remove the hard link named `name`.
+pub fn sys_unlinkat(name: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_unlinkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let name = translated_str(token, name);
+    // only the root directory is supported in this chapter
+    ROOT_INODE.unlink(name.as_str()) as isize
 }

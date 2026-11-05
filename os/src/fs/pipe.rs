@@ -116,6 +116,9 @@ impl File for Pipe {
     fn writable(&self) -> bool {
         self.writable
     }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
     fn read(&self, buf: UserBuffer) -> usize {
         trace!("kernel: Pipe::read");
         assert!(self.readable());
