@@ -183,4 +183,131 @@ impl Inode {
         });
         block_cache_sync_all();
     }
+    /// The unique id of this inode, which is stable during its lifetime.
+    ///
+    /// It is the id used by the file system, so two `Inode` objects pointing
+    /// to the same disk inode get the same id, which is what `fstat` needs.
+    pub fn inode_id(&self) -> u32 {
+        self.fs
+            .lock()
+            .get_disk_inode_id(self.block_id as u32, self.block_offset)
+    }
+    /// The size of the data in current inode
+    pub fn size(&self) -> u32 {
+        self.read_disk_inode(|disk_inode| disk_inode.size)
+    }
+    /// Whether current inode is a directory
+    pub fn is_dir(&self) -> bool {
+        self.read_disk_inode(|disk_inode| disk_inode.is_dir())
+    }
+    /// The number of hard links pointing to current inode
+    pub fn nlink(&self) -> u32 {
+        self.read_disk_inode(|disk_inode| disk_inode.nlink)
+    }
+    /// Create a hard link named `name` in current directory which points to
+    /// the inode `inode_id`.
+    ///
+    /// Return 0 on success, -1 if the name exists or the link count overflows.
+    pub fn link(&self, name: &str, inode_id: u32) -> isize {
+        // the name must not exist
+        if self
+            .read_disk_inode(|disk_inode| self.find_inode_id(name, disk_inode))
+            .is_some()
+        {
+            return -1;
+        }
+        let mut fs = self.fs.lock();
+        // increase the link count of the target inode
+        let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
+        let overflow = get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(block_offset, |disk_inode: &mut DiskInode| {
+                if disk_inode.nlink == u32::MAX {
+                    true
+                } else {
+                    disk_inode.nlink += 1;
+                    false
+                }
+            });
+        if overflow {
+            return -1;
+        }
+        // append a directory entry in the current directory
+        self.modify_disk_inode(|disk_inode| {
+            let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+            let new_size = ((file_count + 1) * DIRENT_SZ) as u32;
+            self.increase_size(new_size, disk_inode, &mut fs);
+            let dirent = DirEntry::new(name, inode_id);
+            disk_inode.write_at(file_count * DIRENT_SZ, dirent.as_bytes(), &self.block_device);
+        });
+        block_cache_sync_all();
+        0
+    }
+    /// Remove the directory entry named `name` in current directory.
+    ///
+    /// The link count of the target inode is decreased, and when it reaches
+    /// zero the inode and its data blocks are deallocated. Return 0 on success,
+    /// -1 if the name does not exist.
+    pub fn unlink(&self, name: &str) -> isize {
+        // find the entry to remove
+        let found = self.read_disk_inode(|disk_inode| {
+            let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+            for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                assert_eq!(
+                    disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device),
+                    DIRENT_SZ,
+                );
+                if dirent.name() == name {
+                    return Some((i, file_count, dirent.inode_id()));
+                }
+            }
+            None
+        });
+        let (index, file_count, inode_id) = match found {
+            Some(found) => found,
+            None => return -1,
+        };
+        let mut fs = self.fs.lock();
+        // decrease the link count, and free the inode when it reaches zero
+        let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
+        let mut released_blocks: Vec<u32> = Vec::new();
+        let mut inode_freed = false;
+        get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(block_offset, |disk_inode: &mut DiskInode| {
+                if disk_inode.nlink > 0 {
+                    disk_inode.nlink -= 1;
+                }
+                if disk_inode.nlink == 0 {
+                    released_blocks = disk_inode.clear_size(&self.block_device);
+                    inode_freed = true;
+                }
+            });
+        for block in released_blocks.into_iter() {
+            fs.dealloc_data(block);
+        }
+        if inode_freed {
+            fs.dealloc_inode(inode_id);
+        }
+        // remove the entry: move the last entry into the hole to keep the
+        // directory compact
+        self.modify_disk_inode(|disk_inode| {
+            if index != file_count - 1 {
+                let mut last = DirEntry::empty();
+                assert_eq!(
+                    disk_inode.read_at(
+                        (file_count - 1) * DIRENT_SZ,
+                        last.as_bytes_mut(),
+                        &self.block_device
+                    ),
+                    DIRENT_SZ,
+                );
+                disk_inode.write_at(index * DIRENT_SZ, last.as_bytes(), &self.block_device);
+            }
+            disk_inode.size -= DIRENT_SZ as u32;
+        });
+        block_cache_sync_all();
+        0
+    }
 }

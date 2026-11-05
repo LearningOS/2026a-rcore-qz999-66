@@ -284,6 +284,76 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
+    /// Map a new area `[start_va, start_va + len)` with `permission`.
+    ///
+    /// The mapping is only created when `start_va` is page aligned, `len` is
+    /// positive, and the range does not overlap any existing area. Return
+    /// `false` if it fails, and then the address space is not modified at all.
+    pub fn mmap(&mut self, start_va: VirtAddr, len: usize, permission: MapPermission) -> bool {
+        if len == 0 || start_va.page_offset() != 0 {
+            return false;
+        }
+        let start_vpn = start_va.floor();
+        let end_vpn: VirtPageNum = VirtAddr::from(start_va.0 + len).ceil();
+        if self
+            .areas
+            .iter()
+            .any(|area| area.overlaps(start_vpn, end_vpn))
+        {
+            return false;
+        }
+        self.push(
+            MapArea::new(
+                start_va,
+                VirtAddr::from(start_va.0 + len),
+                MapType::Framed,
+                permission,
+            ),
+            None,
+        );
+        true
+    }
+    /// Unmap the area `[start_va, start_va + len)`.
+    ///
+    /// `start_va` and `len` must be page aligned, and every page in the range
+    /// must be mapped before so that the range can be removed as a whole.
+    /// Return `false` if it fails, and then the address space is not modified.
+    pub fn munmap(&mut self, start_va: VirtAddr, len: usize) -> bool {
+        if len == 0 || len % PAGE_SIZE != 0 || start_va.page_offset() != 0 {
+            return false;
+        }
+        let start_vpn = start_va.floor();
+        let end_vpn: VirtPageNum = VirtAddr::from(start_va.0 + len).ceil();
+        // Every page in the range must be mapped, and no area can be splitted.
+        let mut mapped_pages = 0;
+        for area in self.areas.iter() {
+            if area.overlaps(start_vpn, end_vpn) {
+                let (area_start, area_end) = area.vpn_range_bound();
+                if !(start_vpn <= area_start && area_end <= end_vpn) {
+                    return false;
+                }
+                mapped_pages += area_end.0 - area_start.0;
+            }
+        }
+        if mapped_pages != end_vpn.0 - start_vpn.0 {
+            return false;
+        }
+        // Remove the areas inside the range one by one.
+        let mut index = 0;
+        while index < self.areas.len() {
+            let (area_start, area_end) = self.areas[index].vpn_range_bound();
+            if start_vpn <= area_start && area_end <= end_vpn {
+                let mut area = self.areas.remove(index);
+                // Clear the page table entries first, then free the frames
+                // when `area` is dropped at the end of this block.
+                area.unmap(&mut self.page_table);
+            } else {
+                index += 1;
+            }
+        }
+        true
+    }
+
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
@@ -342,6 +412,15 @@ impl MapArea {
             map_type,
             map_perm,
         }
+    }
+    /// The start and the end (exclusive) page number of this area.
+    pub fn vpn_range_bound(&self) -> (VirtPageNum, VirtPageNum) {
+        (self.vpn_range.get_start(), self.vpn_range.get_end())
+    }
+    /// Whether this area intersects the page range `[start_vpn, end_vpn)`.
+    pub fn overlaps(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        let (area_start, area_end) = self.vpn_range_bound();
+        area_start < end_vpn && start_vpn < area_end
     }
     pub fn from_another(another: &Self) -> Self {
         Self {

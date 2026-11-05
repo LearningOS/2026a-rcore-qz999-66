@@ -1,7 +1,7 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{BIG_STRIDE, INIT_PRIORITY, TRAP_CONTEXT_BASE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
@@ -71,6 +71,16 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// The priority of the process, used by the stride scheduling algorithm
+    pub priority: usize,
+
+    /// The stride of the process, i.e. how much the process has run
+    pub stride: usize,
+
+    /// The stride increment when the process is scheduled once, which is
+    /// `BIG_STRIDE / priority`
+    pub pass: usize,
 }
 
 impl TaskControlBlockInner {
@@ -135,6 +145,9 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: INIT_PRIORITY,
+                    stride: 0,
+                    pass: BIG_STRIDE / INIT_PRIORITY,
                 })
             },
         };
@@ -216,6 +229,11 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    // the child inherits the priority of its parent, and
+                    // starts with a fresh stride
+                    priority: parent_inner.priority,
+                    stride: 0,
+                    pass: parent_inner.pass,
                 })
             },
         });
@@ -234,6 +252,83 @@ impl TaskControlBlock {
     /// get pid of process
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// Create a new process which executes `elf_data` at once.
+    ///
+    /// It is equivalent to fork + exec, but the address space of the parent is
+    /// not copied at all: the child gets a brand new address space built from
+    /// the elf file, so it is much cheaper than fork + exec.
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        // memory_set with elf program headers/trampoline/trap context/user stack
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        // ---- access parent PCB exclusively
+        let mut parent_inner = self.inner_exclusive_access();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: vec![
+                        // 0 -> stdin
+                        Some(Arc::new(Stdin)),
+                        // 1 -> stdout
+                        Some(Arc::new(Stdout)),
+                        // 2 -> stderr
+                        Some(Arc::new(Stdout)),
+                    ],
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    // the child inherits the priority of its parent, and
+                    // starts with a fresh stride
+                    priority: parent_inner.priority,
+                    stride: 0,
+                    pass: parent_inner.pass,
+                })
+            },
+        });
+        // add child
+        parent_inner.children.push(task_control_block.clone());
+        drop(parent_inner);
+        // prepare TrapContext in user space
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        task_control_block
+    }
+
+    /// Set the priority of the process, and update its `pass` accordingly.
+    ///
+    /// Return `false` if the priority is illegal (it must be at least 2).
+    pub fn set_priority(&self, priority: usize) -> bool {
+        if priority < 2 {
+            return false;
+        }
+        let mut inner = self.inner_exclusive_access();
+        inner.priority = priority;
+        inner.pass = (BIG_STRIDE / priority).max(1);
+        true
     }
 
     /// change the location of the program break. return None if failed.
